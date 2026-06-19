@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import csv
 import logging
+import re
 import struct
 import sys
 import time
@@ -27,10 +28,16 @@ except ImportError as exc:  # pragma: no cover - exercised only without pyserial
 
 
 BAUDRATE = 576000
+COMMAND_TIMEOUT_SECONDS = 25
+WRITE_TIMEOUT_SECONDS = 2
 TINYSA_VID = 0x0483
 TINYSA_PID = 0x5740
 PROMPT = b"ch> "
 DEFAULT_OUTPUT_DIR = Path("sweep_files")
+FREQUENCY_RE = re.compile(
+    r"^\s*(?P<number>\d+(?:\.\d+)?|\.\d+)\s*(?P<suffix>[kmg]?)\s*(?:hz)?\s*$",
+    re.IGNORECASE,
+)
 
 
 class SweepError(RuntimeError):
@@ -38,11 +45,18 @@ class SweepError(RuntimeError):
 
 
 def parse_frequency(value: str) -> int:
-    """Parse CLI frequency values such as '2400e6' into integer Hz."""
-    try:
-        frequency = float(value)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError(f"invalid frequency value: {value!r}") from exc
+    """Parse CLI frequency values such as '880M' or '2400e6' into integer Hz."""
+    match = FREQUENCY_RE.match(value)
+    if match:
+        multiplier = {"": 1, "k": 1_000, "m": 1_000_000, "g": 1_000_000_000}[
+            match.group("suffix").lower()
+        ]
+        frequency = float(match.group("number")) * multiplier
+    else:
+        try:
+            frequency = float(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(f"invalid frequency value: {value!r}") from exc
 
     if frequency <= 0:
         raise argparse.ArgumentTypeError("frequency values must be positive")
@@ -146,6 +160,9 @@ def choose_port(port_override: str | None) -> str:
 
 
 def clear_buffer(usb: serial.Serial) -> None:
+    usb.reset_input_buffer()
+    usb.reset_output_buffer()
+    time.sleep(0.1)
     while usb.in_waiting:
         usb.read_all()
         time.sleep(0.01)
@@ -154,11 +171,27 @@ def clear_buffer(usb: serial.Serial) -> None:
 def serial_query(usb: serial.Serial, command: str) -> str:
     payload = command.encode()
     usb.write(payload)
-    usb.read_until(payload + b"\n")
     response = usb.read_until(PROMPT)
     if not response.endswith(PROMPT):
-        raise SweepError(f"timed out waiting for prompt after {command.strip()!r}")
-    return response[: -len(PROMPT)].decode(errors="replace").strip()
+        partial = response.decode(errors="replace").strip()
+        detail = f"; partial response: {partial!r}" if partial else ""
+        raise SweepError(f"timed out waiting for prompt after {command.strip()!r}{detail}")
+
+    text = response[: -len(PROMPT)].decode(errors="replace").strip()
+    lines = text.splitlines()
+    if lines and lines[0].strip() == command.strip():
+        lines = lines[1:]
+    return "\n".join(line for line in lines).strip()
+
+
+def query_version(usb: serial.Serial) -> str:
+    response = serial_query(usb, "version\r")
+    if "tinySA" in response:
+        return response
+
+    usb.write(b"\r")
+    usb.read_until(PROMPT)
+    return serial_query(usb, "version\r")
 
 
 def serial_write(usb: serial.Serial, command: str) -> None:
@@ -257,9 +290,14 @@ def main(argv: Iterable[str] | None = None) -> int:
         port = choose_port(args.port)
 
         logging.info("opening %s at %s baud", port, BAUDRATE)
-        with serial.Serial(port, baudrate=BAUDRATE, timeout=2) as usb:
+        with serial.Serial(
+            port,
+            baudrate=BAUDRATE,
+            timeout=COMMAND_TIMEOUT_SECONDS,
+            write_timeout=WRITE_TIMEOUT_SECONDS,
+        ) as usb:
             clear_buffer(usb)
-            version = serial_query(usb, "version\r")
+            version = query_version(usb)
             scale = scale_for_version(version)
             logging.info("device: %s", version)
             setup_device(usb, version, args.rbw)
