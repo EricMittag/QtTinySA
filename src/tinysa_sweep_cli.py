@@ -45,7 +45,7 @@ class SweepError(RuntimeError):
 
 
 def parse_frequency(value: str) -> int:
-    """Parse CLI frequency values such as '880M' or '2400e6' into integer Hz."""
+    """Parse CLI frequency values such as '880e6' into integer Hz."""
     match = FREQUENCY_RE.match(value)
     if match:
         multiplier = {"": 1, "k": 1_000, "m": 1_000_000, "g": 1_000_000_000}[

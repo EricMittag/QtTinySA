@@ -51,7 +51,7 @@ class GeneratorError(RuntimeError):
 
 
 def parse_frequency(value: str) -> int:
-    """Parse CLI frequency values such as '880M' or '2400e6' into integer Hz."""
+    """Parse CLI frequency values such as '880e6' into integer Hz."""
     match = FREQUENCY_RE.match(value)
     if match:
         multiplier = {"": 1, "k": 1_000, "m": 1_000_000, "g": 1_000_000_000}[
@@ -559,6 +559,20 @@ def run_handoff(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_idle(args: argparse.Namespace) -> int:
+    commands = ["output off\r", "mode input\r", "pause\r"]
+    if args.dry_run:
+        print_commands(commands + HANDOFF_RESTORE_COMMANDS)
+        return 0
+
+    port = choose_port(args.port)
+    send_command_group(port, commands, restore_commands=HANDOFF_RESTORE_COMMANDS)
+    print("tinySA Ultra generator output: off")
+    print("mode: input/analyzer")
+    print("sweep: paused")
+    return 0
+
+
 def run_apply(args: argparse.Namespace) -> int:
     groups = [
         frequency_commands(args.freq, "ui"),
@@ -723,6 +737,15 @@ def build_parser() -> argparse.ArgumentParser:
     handoff.add_argument("--dry-run", action="store_true", help="print serial commands without opening the device")
     handoff.add_argument("--verbose", action="store_true", help="show serial setup and command progress")
     handoff.set_defaults(func=run_handoff)
+
+    idle = subparsers.add_parser(
+        "idle",
+        help="park the tinySA with generator off, analyzer input mode, and sweep paused",
+    )
+    idle.add_argument("--port", help="serial port override, e.g. /dev/ttyACM0 or COM3")
+    idle.add_argument("--dry-run", action="store_true", help="print serial commands without opening the device")
+    idle.add_argument("--verbose", action="store_true", help="show serial setup and command progress")
+    idle.set_defaults(func=run_idle)
 
     on = subparsers.add_parser("on", help="turn RF output on")
     on.add_argument("--port", help="serial port override, e.g. /dev/ttyACM0 or COM3")
