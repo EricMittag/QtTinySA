@@ -37,7 +37,9 @@ LEVEL_MIN_DBM = -115.0
 LEVEL_MAX_DBM = -18.0
 DEFAULT_TEST_LEVEL_DBM = -18.5
 DEFAULT_CAPTURE_DIR = Path("captures")
-SESSION_RESTORE_COMMANDS = ["release\r", "abort on\r"]
+DEFAULT_GROUP_DELAY_SECONDS = 1.0
+SESSION_RESTORE_COMMANDS = ["abort on\r"]
+HANDOFF_RESTORE_COMMANDS = ["release\r", "abort on\r"]
 FREQUENCY_RE = re.compile(
     r"^\s*(?P<number>\d+(?:\.\d+)?|\.\d+)\s*(?P<suffix>[kmg]?)\s*(?:hz)?\s*$",
     re.IGNORECASE,
@@ -88,6 +90,17 @@ def parse_duration(value: str) -> float:
 
     if duration <= 0:
         raise argparse.ArgumentTypeError("duration must be positive")
+    return duration
+
+
+def parse_nonnegative_duration(value: str) -> float:
+    try:
+        duration = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid duration value: {value!r}") from exc
+
+    if duration < 0:
+        raise argparse.ArgumentTypeError("duration must be non-negative")
     return duration
 
 
@@ -349,16 +362,31 @@ def send_command_group(
     commands: list[str],
     step: bool = False,
     restore_interactive: bool = True,
+    restore_commands: list[str] | None = None,
 ) -> None:
     with open_ultra(port) as usb:
+        completed = False
         try:
             if step:
                 send_commands_stepwise(usb, commands)
             else:
                 send_commands(usb, commands)
+            completed = True
         finally:
-            if restore_interactive:
-                send_best_effort(usb, SESSION_RESTORE_COMMANDS)
+            if restore_interactive and completed:
+                send_best_effort(usb, restore_commands or SESSION_RESTORE_COMMANDS)
+
+
+def send_command_groups(
+    port: str,
+    groups: list[list[str]],
+    step: bool = False,
+    group_delay: float = DEFAULT_GROUP_DELAY_SECONDS,
+) -> None:
+    for index, group in enumerate(groups):
+        send_command_group(port, group, step)
+        if group_delay and index < len(groups) - 1:
+            time.sleep(group_delay)
 
 
 def print_commands(commands: list[str]) -> None:
@@ -403,7 +431,7 @@ def run_start(args: argparse.Namespace) -> int:
             print("output off")
             if args.handoff_sweep:
                 print("mode input")
-                print_commands(SESSION_RESTORE_COMMANDS)
+                print_commands(HANDOFF_RESTORE_COMMANDS)
         return 0
 
     port = choose_port(args.port)
@@ -415,8 +443,7 @@ def run_start(args: argparse.Namespace) -> int:
             groups.append([high_mode_command(args.high_mode)])
         groups.extend([ui_level_commands(args.level), ["output on\r"]])
 
-        for group in groups:
-            send_command_group(port, group, args.step)
+        send_command_groups(port, groups, args.step, args.group_delay)
 
         print("Configured tinySA Ultra generator:")
         print(f"frequency: {args.freq / 1e6:.6f} MHz")
@@ -430,7 +457,13 @@ def run_start(args: argparse.Namespace) -> int:
             send_command_group(port, ["output off\r"])
             print("output: off")
             if args.handoff_sweep:
-                send_command_group(port, ["mode input\r"])
+                if args.group_delay:
+                    time.sleep(args.group_delay)
+                send_command_group(
+                    port,
+                    ["mode input\r"],
+                    restore_commands=HANDOFF_RESTORE_COMMANDS,
+                )
                 print("mode: input/analyzer")
         else:
             print("duration: persistent; run the stop command to turn output off")
@@ -458,7 +491,7 @@ def run_start(args: argparse.Namespace) -> int:
             print("output: off")
             if args.handoff_sweep:
                 send_commands(usb, ["mode input\r"])
-                send_best_effort(usb, SESSION_RESTORE_COMMANDS)
+                send_best_effort(usb, HANDOFF_RESTORE_COMMANDS)
                 print("mode: input/analyzer")
         else:
             print("duration: persistent; run the stop command to turn output off")
@@ -516,11 +549,11 @@ def run_setlevel(args: argparse.Namespace) -> int:
 def run_handoff(args: argparse.Namespace) -> int:
     commands = ["output off\r", "mode input\r"]
     if args.dry_run:
-        print_commands(commands + SESSION_RESTORE_COMMANDS)
+        print_commands(commands + HANDOFF_RESTORE_COMMANDS)
         return 0
 
     port = choose_port(args.port)
-    send_command_group(port, commands)
+    send_command_group(port, commands, restore_commands=HANDOFF_RESTORE_COMMANDS)
     print("tinySA Ultra generator output: off")
     print("mode: input/analyzer")
     return 0
@@ -537,8 +570,7 @@ def run_apply(args: argparse.Namespace) -> int:
         return 0
 
     port = choose_port(args.port)
-    for group in groups:
-        send_command_group(port, group, args.step)
+    send_command_groups(port, groups, args.step, args.group_delay)
     print(f"tinySA generator set to {args.freq / 1e6:.6f} MHz at {args.level:.1f} dBm")
     print("output state unchanged; enable output manually on the tinySA first")
     return 0
@@ -623,6 +655,12 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("--duration", type=parse_duration, help="seconds to leave output on before stopping")
     start.add_argument("--port", help="serial port override, e.g. /dev/ttyACM0 or COM3")
     start.add_argument("--command-timeout", type=parse_duration, help="serial read timeout per command in seconds")
+    start.add_argument(
+        "--group-delay",
+        default=DEFAULT_GROUP_DELAY_SECONDS,
+        type=parse_nonnegative_duration,
+        help=f"seconds to wait between UI command groups (default: {DEFAULT_GROUP_DELAY_SECONDS:g})",
+    )
     start.add_argument("--dry-run", action="store_true", help="print serial commands without opening the device")
     start.add_argument("--step", action="store_true", help="pause before and after each serial command")
     start.add_argument(
@@ -655,6 +693,12 @@ def build_parser() -> argparse.ArgumentParser:
     test880.add_argument("--duration", type=parse_duration, help="seconds to leave output on before stopping")
     test880.add_argument("--port", help="serial port override, e.g. /dev/ttyACM0 or COM3")
     test880.add_argument("--command-timeout", type=parse_duration, help="serial read timeout per command in seconds")
+    test880.add_argument(
+        "--group-delay",
+        default=DEFAULT_GROUP_DELAY_SECONDS,
+        type=parse_nonnegative_duration,
+        help=f"seconds to wait between UI command groups (default: {DEFAULT_GROUP_DELAY_SECONDS:g})",
+    )
     test880.add_argument("--dry-run", action="store_true", help="print serial commands without opening the device")
     test880.add_argument("--step", action="store_true", help="pause before and after each serial command")
     test880.add_argument(
@@ -709,6 +753,12 @@ def build_parser() -> argparse.ArgumentParser:
     apply.add_argument("--freq", required=True, type=parse_frequency, help="output frequency in Hz")
     apply.add_argument("--level", required=True, type=parse_level, help="output level in dBm")
     apply.add_argument("--port", help="serial port override, e.g. /dev/ttyACM0 or COM3")
+    apply.add_argument(
+        "--group-delay",
+        default=DEFAULT_GROUP_DELAY_SECONDS,
+        type=parse_nonnegative_duration,
+        help=f"seconds to wait between UI command groups (default: {DEFAULT_GROUP_DELAY_SECONDS:g})",
+    )
     apply.add_argument("--dry-run", action="store_true", help="print serial commands without opening the device")
     apply.add_argument("--step", action="store_true", help="pause before and after each serial command")
     apply.add_argument("--verbose", action="store_true", help="show serial setup and command progress")
